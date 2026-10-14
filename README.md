@@ -1,4 +1,4 @@
-# HSTK for PowerShell
+# Hammerspace Toolkit (HSTK) for PowerShell
 
 **Version 1.1.0** · 2026-10-13 · Author: Jason Ventresco · [Changelog](CHANGELOG.md)
 
