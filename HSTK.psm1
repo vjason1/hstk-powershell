@@ -1,29 +1,60 @@
+# ==============================================================================
+#  HSTK.psm1 — Hammerspace Toolkit (hs) for PowerShell
+# ==============================================================================
 #
-# HSTK - Hammerspace toolkit, PowerShell port of https://github.com/hammer-space/hstk
+#  Author:       Jason Ventresco
+#  Version:      1.1.0
+#  Last Updated: 2026-10-13
 #
-# Copyright 2021 Hammerspace (original Python implementation)
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#     http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#  PowerShell port of the Hammerspace hstk Python CLI (hammer-space/hstk 4.6.6.1):
+#  the same `hs` command, subcommands, options and exit codes, with no Python
+#  dependency.  Runs on Windows PowerShell 5.1 and PowerShell 7+ (Windows, Linux,
+#  macOS) against a Hammerspace share, using the .fs_command_gateway shadow file
+#  (Hammerspace 4.6.5 or later).
 #
-# Works on Windows PowerShell 5.1 and PowerShell 7+ (Windows, Linux, macOS).
+#  CHANGELOG:
+#    1.1.0  (2026-10-13)  macOS SMB mounts: an I/O error from the command gateway
+#                         now explains that the macOS SMB client is not supported
+#                         and prints the NFS mount command for that share.
+#                         Author/changelog headers, CHANGELOG.md, docs update.
+#    1.0.2  (2026-10-13)  hs.ps1 finds the module when run without the .ps1
+#                         extension or through a symlink, else falls back to an
+#                         installed HSTK module.  Execute bit set in the zip.
+#    1.0.1  (2026-10-13)  Gateway I/O on macOS/Linux uses plain POSIX
+#                         creat/write/read/close (the same calls as Python)
+#                         instead of .NET FileStream, which adds flock() calls.
+#                         Native helper DLLs are compiled once and cached.
+#    1.0.0  (2026-10-13)  Initial port of hstk 4.6.6.1.  All 17 commands and
+#                         subcommands, click-compatible parsing and errors,
+#                         Invoke-HsEval / Invoke-HsSum library functions.  Fixes
+#                         upstream bugs: dry run (-n) crash, missing -u/--unbound,
+#                         rm --interactive and -r/-f fallback, rsync os.stat('')
+#                         crash, rsync on Windows (ACL copy instead of chown).
 #
-# Layout of this file mirrors the Python package:
-#   1. hsscript   - builds the hammerscript command strings  (hstk/hsscript.py)
-#   2. gateway    - writes/reads the .fs_command_gateway file (ShadCmd in hscli.py)
-#   3. cli engine - a small click-compatible argument parser
-#   4. commands   - every `hs` subcommand                     (hscli.py)
+# ==============================================================================
+#
+#  Original implementation: Copyright 2021 Hammerspace
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#      http://www.apache.org/licenses/LICENSE-2.0
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+#  Layout of this file mirrors the Python package:
+#    1. hsscript   - builds the hammerscript command strings  (hstk/hsscript.py)
+#    2. gateway    - writes/reads the .fs_command_gateway file (ShadCmd in hscli.py)
+#    3. cli engine - a small click-compatible argument parser
+#    4. commands   - every `hs` subcommand                     (hscli.py)
 #
 
 $ErrorActionPreference = 'Stop'
 
-$script:HsVersion = '4.6.6.1'
+$script:HsVersion = '1.1.0'            # this port
+$script:HstkUpstreamVersion = '4.6.6.1'  # hammer-space/hstk release it mirrors
 $script:IsWin = ($PSVersionTable.PSEdition -eq 'Desktop') -or ((Test-Path variable:IsWindows) -and $IsWindows)
 $script:IsMac = (Test-Path variable:IsMacOS) -and $IsMacOS
 # For windows clients the write to the gateway file must be big enough to be pushed
@@ -253,8 +284,194 @@ namespace Hstk {
 }
 '@
 
-function Initialize-HsNative {
-    if (-not ('Hstk.Native' -as [type])) { Add-Type -TypeDefinition $script:NativeSrc }
+# Plain POSIX I/O for the gateway file on macOS/Linux.  .NET's FileStream takes an advisory flock()
+# on every open (and drops it on close); on an SMB/NFS Hammerspace mount that lock goes to the server
+# and the gateway rejects it with EIO.  Python's open() takes no lock, so do the same syscalls it does.
+# creat() is used instead of open(..., O_CREAT, mode) because open is variadic, which P/Invoke can't
+# call correctly on Apple arm64.
+$script:PosixSrc = @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+namespace Hstk {
+    public static class Posix {
+        const string LIBC = "@LIBC@";
+        [DllImport(LIBC, SetLastError = true)] static extern int creat(string path, uint mode);
+        [DllImport(LIBC, SetLastError = true)] static extern int open(string path, int flags);
+        [DllImport(LIBC, SetLastError = true)] static extern IntPtr write(int fd, byte[] buf, IntPtr count);
+        [DllImport(LIBC, SetLastError = true)] static extern IntPtr read(int fd, byte[] buf, IntPtr count);
+        [DllImport(LIBC, SetLastError = true)] static extern int close(int fd);
+        const int EINTR = 4;
+
+        static IOException Err(string op, string path) {
+            int errno = Marshal.GetLastWin32Error();
+            string msg = new System.ComponentModel.Win32Exception(errno).Message;
+            return new IOException("[Errno " + errno + "] " + msg + ": " + op + " '" + path + "'", errno);
+        }
+
+        // open(path, 'wb'); write(data); close()
+        public static void WriteFile(string path, byte[] data) {
+            int fd = creat(path, 438 /* 0666, umask applies */);
+            if (fd < 0) throw Err("open", path);
+            bool ok = false;
+            try {
+                int off = 0;
+                while (off < data.Length) {
+                    byte[] chunk = data;
+                    if (off > 0) { chunk = new byte[data.Length - off]; Array.Copy(data, off, chunk, 0, chunk.Length); }
+                    long n = (long)write(fd, chunk, (IntPtr)chunk.Length);
+                    if (n < 0) { if (Marshal.GetLastWin32Error() == EINTR) continue; throw Err("write", path); }
+                    off += (int)n;
+                }
+                ok = true;
+            } finally {
+                int rc = close(fd);
+                if (rc != 0 && ok) throw Err("close", path);
+            }
+        }
+
+        // open(path, 'r').read()
+        public static byte[] ReadFile(string path) {
+            int fd = open(path, 0 /* O_RDONLY */);
+            if (fd < 0) throw Err("open", path);
+            try {
+                MemoryStream ms = new MemoryStream();
+                byte[] buf = new byte[65536];
+                while (true) {
+                    long n = (long)read(fd, buf, (IntPtr)buf.Length);
+                    if (n < 0) { if (Marshal.GetLastWin32Error() == EINTR) continue; throw Err("read", path); }
+                    if (n == 0) break;
+                    ms.Write(buf, 0, (int)n);
+                }
+                return ms.ToArray();
+            } finally { close(fd); }
+        }
+    }
+}
+'@
+
+# Compile a helper type once and cache the DLL, so later runs don't pay the compile cost
+function Import-HsNativeType([string]$TypeName, [string]$Source) {
+    if ($TypeName -as [type]) { return }
+    $hash = [BitConverter]::ToString((New-Object System.Security.Cryptography.SHA256Managed).ComputeHash($script:Utf8.GetBytes($Source + $PSVersionTable.PSVersion))).Replace('-', '').Substring(0, 16)
+    $dll = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'hstk-' + $hash + '.dll')
+    try {
+        if (-not [System.IO.File]::Exists($dll)) {
+            $tmp = $dll + '.' + [guid]::NewGuid().ToString('N')
+            Add-Type -TypeDefinition $Source -OutputAssembly $tmp -OutputType Library
+            try { [System.IO.File]::Move($tmp, $dll) } catch { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+        }
+        if (-not ($TypeName -as [type])) { Add-Type -Path $dll }
+    } catch {
+        if (-not ($TypeName -as [type])) { Add-Type -TypeDefinition $Source }
+    }
+}
+
+function Initialize-HsNative { Import-HsNativeType 'Hstk.Native' $script:NativeSrc }
+
+function Initialize-HsPosix {
+    if ($script:IsMac) { $lib = '/usr/lib/libSystem.B.dylib' } else { $lib = 'libc.so.6' }
+    Import-HsNativeType 'Hstk.Posix' ($script:PosixSrc.Replace('@LIBC@', $lib))
+}
+
+# Write the command to / read the reply from the gateway file
+function Write-HsGatewayFile([string]$Path, [byte[]]$Bytes) {
+    if (-not $script:IsWin) { Initialize-HsPosix; [Hstk.Posix]::WriteFile($Path, $Bytes); return }
+    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+    try { $fs.Write($Bytes, 0, $Bytes.Length); $fs.Flush() } finally { $fs.Dispose() }
+}
+
+function Read-HsGatewayFile([string]$Path) {
+    if (-not $script:IsWin) { Initialize-HsPosix; return $script:Utf8.GetString([Hstk.Posix]::ReadFile($Path)) }
+    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $reader = New-Object System.IO.StreamReader($fs, $script:Utf8)
+        $reader.ReadToEnd()
+    } finally { $fs.Dispose() }
+}
+
+# --- macOS SMB detection -------------------------------------------------------------
+# The Hammerspace command gateway rejects every command sent through the macOS SMB client
+# (smbfs) with EIO, while the same share mounted over NFS works.  When that happens, explain
+# it and print the NFS mount command for that share rather than a bare I/O error.
+
+$script:MountTable = $null
+
+# Parsed `mount` output: @{ Source; Point; Type } per mount (macOS format)
+function Get-HsMountTable {
+    if ($null -ne $script:MountTable) { return $script:MountTable }
+    $rows = @()
+    try {
+        $mountExe = Get-Command -Name mount -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        foreach ($l in (& $mountExe.Source 2>$null)) {
+            # macOS:  //user@host/share on /Volumes/share (smbfs, nodev, nosuid, mounted by user)
+            if ([string]$l -match '^(.+?) on (.+) \(([^,\s)]+)') {
+                $rows += @{ Source = $Matches[1]; Point = $Matches[2]; Type = $Matches[3] }
+            }
+        }
+    } catch { }
+    $script:MountTable = $rows
+    $rows
+}
+
+# The mount holding $FullPath (longest matching mount point), or $null
+function Get-HsMountFor([string]$FullPath) {
+    $best = $null
+    foreach ($m in (Get-HsMountTable)) {
+        $pt = $m.Point.TrimEnd('/')
+        if ($FullPath -eq $m.Point -or $FullPath -eq $pt -or $FullPath.StartsWith($pt + '/', [StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -eq $best -or $pt.Length -gt $best.Point.TrimEnd('/').Length) { $best = $m }
+        }
+    }
+    $best
+}
+
+# True if the exception chain contains an EIO (errno 5) IOException from the POSIX gateway I/O
+function Test-HsEio($Exception) {
+    $ex = $Exception
+    while ($null -ne $ex) {
+        if ($ex -is [System.IO.IOException] -and $ex.HResult -eq 5) { return $true }
+        $ex = $ex.InnerException
+    }
+    $false
+}
+
+# Explanation for a gateway EIO on a macOS SMB mount, or $null if that's not the situation
+function Get-HsSmbHint([string]$GatewayPath) {
+    if (-not $script:IsMac) { return $null }
+    $m = Get-HsMountFor $GatewayPath
+    if ($null -eq $m -or $m.Type -ne 'smbfs') { return $null }
+    $server = '<server>'; $share = '<share>'
+    if ($m.Source -match '^//(?:[^@/]*@)?([^/]+)/(.+)$') {
+        $server = $Matches[1]
+        $share = [Uri]::UnescapeDataString($Matches[2]).TrimEnd('/')
+    }
+    $nfsPoint = $m.Point.TrimEnd('/') + '-nfs'
+    # single-quote for the shell only when needed
+    $q = { param($v) if ($v -match '^[A-Za-z0-9._/:@%+=-]+$') { $v } else { "'" + $v.Replace("'", "'\''") + "'" } }
+    @(
+        ("Error: the Hammerspace command gateway returned an I/O error on '" + $m.Point + "'."),
+        ("'" + $m.Point + "' is an SMB mount (" + $m.Source + "), and Hammerspace commands do not work"),
+        'through the macOS SMB client. Mount the same share over NFS and run hs from there:',
+        '',
+        ('    sudo mkdir -p ' + (& $q $nfsPoint)),
+        ('    sudo mount -t nfs -o vers=3,resvport ' + (& $q ($server + ':/' + $share)) + ' ' + (& $q $nfsPoint)),
+        '',
+        ("If the export path differs, 'showmount -e " + $server + "' lists them.")
+    ) -join "`n"
+}
+
+# Run a gateway file operation; turn a macOS-SMB EIO into the explanation above
+function Invoke-HsGatewayIo([string]$GatewayPath, [scriptblock]$Op) {
+    try {
+        & $Op
+    } catch {
+        if (Test-HsEio $_.Exception) {
+            $hint = Get-HsSmbHint $GatewayPath
+            if ($hint) { Write-HsErr $hint; Exit-Hs 1 }
+        }
+        throw
+    }
 }
 
 function Get-HsStat([string]$Path) {
@@ -567,18 +784,9 @@ function Invoke-HsGatewayCmd([string]$Path, [string]$Gen, $Kw) {
     [Array]::Copy($body, $bytes, $body.Length)
 
     Write-HsVerbose ('write( ' + (Format-PyBytes $bytes) + ' )')
-    if (-not $script:G.dry_run) {
-        $fs = New-Object System.IO.FileStream($gwFull, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-        try {
-            $fs.Write($bytes, 0, $bytes.Length)
-            Write-HsVerbose 'flush()'
-            $fs.Flush()
-            Write-HsVerbose ('close( ' + $gwDisp + ' )')
-        } finally { $fs.Dispose() }
-    } else {
-        Write-HsVerbose 'flush()'
-        Write-HsVerbose ('close( ' + $gwDisp + ' )')
-    }
+    Write-HsVerbose 'flush()'
+    Write-HsVerbose ('close( ' + $gwDisp + ' )')
+    if (-not $script:G.dry_run) { Invoke-HsGatewayIo $gwFull { Write-HsGatewayFile $gwFull $bytes } }
 
     # open again to collect the results
     Write-HsVerbose ('open( ' + $gwDisp + ' )')
@@ -586,11 +794,7 @@ function Invoke-HsGatewayCmd([string]$Path, [string]$Gen, $Kw) {
     if ($script:G.dry_run) {
         $text = 'dry run output'
     } else {
-        $fs = New-Object System.IO.FileStream($gwFull, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        try {
-            $reader = New-Object System.IO.StreamReader($fs, $script:Utf8)
-            $text = $reader.ReadToEnd()
-        } finally { $fs.Dispose() }
+        $text = Invoke-HsGatewayIo $gwFull { Read-HsGatewayFile $gwFull }
         $text = $text -replace "`r`n", "`n"
     }
     $nlines = ([regex]::Matches($text, "`n")).Count
